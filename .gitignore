@@ -1,0 +1,29 @@
+# Config (contains tokens)
+config.json
+
+# Build
+build/
+dist/
+*.spec.log
+
+# Executable (use Releases for installer)
+BabsBot.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Optional assets (user-generated)
+icon.ico
+logo.png

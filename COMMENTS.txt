@@ -1,0 +1,107 @@
+================================================================================
+BabsBot – User-editable comments and notes
+================================================================================
+Edit this file to add your own notes. It does not affect how the app runs.
+================================================================================
+
+---- OVERVIEW ----
+BabsBot is a small Windows desktop app that connects to Twitch channel DelboiTV,
+listens for follow / raid / sub / channel point redemption events, and posts
+random dry-humour responses in chat. The UI is a 200x200 dark glassmorphic
+window with logo, status text, and a settings gear. Config is stored in
+config.json next to the executable.
+
+---- TWITCHIO VERSION ----
+This app uses twitchio 2.x (requirements: twitchio>=2.0.0,<3.0.0). TwitchIO 3.x
+changed the Bot API (client_id, client_secret, bot_id, prefix required); we use
+the 2.x style with token + initial_channels. If you upgrade to 3.x, the bot will
+fail to start until the code is updated.
+
+---- FILE ROLES ----
+main.py          Application entry and all logic (UI, settings, bot, EventSub).
+config.json      Created when you Save in settings. Holds access_token,
+                 refresh_token, client_id. Auto-loaded on start.
+logo.png         Optional. Place in same folder as the app; shown in the centre.
+COMMENTS.txt     This file. For your notes only.
+
+---- MAIN WINDOW ----
+The window is fixed 200x200, dark background, rounded border. Centre shows
+logo.png (or placeholder text if missing). Below: "BabsBot - Running" (or
+"No token" / "Connecting…" / "Error"). Top-right: gear button opens Settings.
+
+---- SETTINGS ----
+"Get Twitch Tokens" opens a link that includes all required scopes:
+  chat:read, chat:edit, moderator:read:followers, channel:read:subscriptions, channel:read:redemptions
+- moderator:read:followers → follow events (channel.follow v2)
+- channel:read:subscriptions → sub events
+- channel:read:redemptions → channel point redemptions
+Without these, EventSub will reject subscriptions (403) and the app will show a warning.
+Paste Access Token (required). Client ID is required for EventSub (follow/raid/sub/redemption);
+add it via "Show optional fields". Refresh Token is optional (for future token refresh).
+Save writes config.json. Restart the app after saving.
+
+---- HOW TO SEE THE BOT WHILE OFFLINE ----
+1. Open https://www.twitch.tv/delboitv/chat in your browser (your channel's chat).
+2. Run BabsBot and wait until the app shows "Running".
+3. Click the "Test chat" button. The app will show "Sent!" for a moment.
+4. Look at the Twitch chat tab—you should see: "BabsBot here. I'll call out follows, raids, subs and redemptions."
+You do not need to be live. If no message appears: make sure the token was generated with chat:read and chat:edit (twitchtokengenerator.com), and that the bot account is not restricted (e.g. Twitch may require a verified phone number to chat in some channels).
+
+---- KNOWING THE BOT IS CONNECTED ----
+The app shows "Running" when connected. On connect it also tries to send one message in chat; you can always use "Test chat" to send it again. EventSub events (follow, raid, sub, redemption) only fire when they actually happen.
+
+---- BOT BEHAVIOUR ----
+On start, if access_token exists in config, the app starts a background bot
+that joins channel DelboiTV. It also connects to Twitch EventSub over
+WebSocket and subscribes to: channel.follow, channel.raid, channel.subscribe,
+channel.channel_points_custom_reward_redemption.add. When an event is
+received, the bot picks a random line from the matching list and sends it
+in chat. Tone: dry, dark humour, honest, warm underneath.
+
+---- RESPONSE LISTS (in main.py) ----
+FOLLOWER_RESPONSES   New follower; message can use {} for username.
+RAID_RESPONSES       Incoming raid; no username.
+SUB_RESPONSES        New subscriber; no username.
+REDEMPTION_RESPONSES Channel point redemption; message can use {} for username.
+To add more lines: edit the list in main.py (e.g. FOLLOWER_RESPONSES.append(...)
+or add new strings in the list). Restart the app after editing.
+
+---- EVENTSUB ----
+EventSub runs in the same process as the chat bot. It connects to
+wss://eventsub.wss.twitch.tv/ws, gets a session_id, cleans up old websocket
+subscriptions for this client, then creates subscriptions for follow/raid/sub/redemption.
+Client ID + token with the right scopes are required; otherwise the app shows
+a warning and only chat works. On success, status tooltip shows "EventSub: follow, raid, sub, redemption".
+
+---- BUILDING BabsBot.exe ----
+Use PyInstaller with --noconsole so no console window appears. Example:
+  pyinstaller --onefile --windowed --name BabsBot main.py
+Copy logo.png and (if you want) COMMENTS.txt into the dist folder. Config
+is created at runtime next to the .exe.
+
+---- TESTING LOCALLY ----
+  cd BabsBot
+  pip install -r requirements.txt
+  python main.py
+A console window will show when run with "python". For no console during
+development you can use pythonw main.py (Windows). After building with
+--windowed, the .exe runs without a console.
+
+---- CHANNEL ----
+The bot connects to channel: delboitv
+To change it: edit the constant CHANNEL in main.py.
+
+---- SCOPES & EVENTS ----
+Follows work even when the channel is offline. Raids, subs, and channel point
+redemptions only fire when the channel is live. If you are not the broadcaster,
+the token user must be a moderator in the channel for follow events to work.
+
+---- TOKEN REFRESH ----
+Refresh Token is stored but not used yet. When the access token expires, the bot
+stops; regenerate a token and paste the new Access Token (and optionally Refresh
+Token) in Settings. Future versions could use the refresh endpoint to renew automatically.
+
+---- YOUR NOTES ----
+(Add your own notes below.)
+
+
