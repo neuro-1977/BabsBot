@@ -1,7 +1,11 @@
 import asyncio
 import json
 import random
+import secrets
 import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 def _app_dir():
@@ -9,8 +13,8 @@ def _app_dir():
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon, QPixmap, QFont
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QUrl
+from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -30,9 +34,13 @@ from twitchio.ext import commands
 
 CONFIG_PATH = _app_dir() / "config.json"
 CHANNEL = "delboitv"
+OAUTH_PORT = 8765
+OAUTH_REDIRECT_URI = f"http://localhost:{OAUTH_PORT}/callback"
+OAUTH_SCOPES = "chat:read chat:edit moderator:read:followers channel:read:subscriptions channel:read:redemptions"
 TOKEN_GENERATOR_URL = (
-    "https://twitchtokengenerator.com/quick/"
-    "moderator-read-followers+channel-read-subscriptions+channel-read-redemptions+chat-read+chat-edit"
+    "https://twitchtokengenerator.com/"
+    "?auth=auth_stay&scope=chat%3Aread+chat%3Aedit+moderator%3Aread%3Afollowers"
+    "+channel%3Aread%3Asubscriptions+channel%3Aread%3Aredemptions"
 )
 
 FOLLOWER_RESPONSES = [
@@ -91,19 +99,79 @@ def save_config(data):
         return False
 
 
+_oauth_token_queue = []
+_oauth_server_ref = [None]
+
+
+def _make_oauth_handler():
+    class OAuthHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            try:
+                if self.path.startswith("/callback"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"""<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;background:#1a1a1a;color:#00ff00;padding:2em;text-align:center;">
+<script>
+var h = location.hash.substring(1);
+var p = new URLSearchParams(h);
+var t = p.get('access_token');
+if (t) location.replace('http://localhost:%s/capture?access_token=' + encodeURIComponent(t));
+else document.body.innerHTML = '<p>No token received. Close this window.</p>';
+</script>
+<p>Please wait...</p>
+</body></html>""" % OAUTH_PORT)
+                    return
+                if self.path.startswith("/capture?"):
+                    qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    tokens = qs.get("access_token", [])
+                    if tokens:
+                        _oauth_token_queue.append(tokens[0])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"""<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;background:#1a1a1a;color:#00ff00;padding:2em;text-align:center;">
+<h2>Success!</h2><p>Close this window and return to BabsBot. Click Save.</p>
+</body></html>""")
+                    srv = _oauth_server_ref[0]
+                    if srv:
+                        threading.Thread(target=srv.shutdown, daemon=True).start()
+            except Exception:
+                pass
+    return OAuthHandler
+
+
+def _run_oauth_server():
+    handler = _make_oauth_handler()
+    server = HTTPServer(("127.0.0.1", OAUTH_PORT), handler)
+    server.allow_reuse_address = True
+    _oauth_server_ref[0] = server
+    try:
+        server.serve_forever()
+    except Exception:
+        pass
+    _oauth_server_ref[0] = None
+
+
 class BotRunner(QThread):
     status = pyqtSignal(str)
     error = pyqtSignal(str)
     eventsub_warning = pyqtSignal(str)
     eventsub_ready = pyqtSignal()
+    channel_ready = pyqtSignal(str)
 
-    def __init__(self, access_token, refresh_token, client_id, parent=None):
+    def __init__(self, access_token, refresh_token, client_id, channel_override=None, parent=None):
         super().__init__(parent)
         self.access_token = (access_token or "").strip().replace("oauth:", "")
         if self.access_token and not self.access_token.startswith("oauth:"):
             self.access_token = "oauth:" + self.access_token
         self.refresh_token = (refresh_token or "").strip() or None
         self.client_id = (client_id or "").strip() or None
+        self._channel_override = (channel_override or "").strip().lower().replace("#", "") or None
+        self._channel = None
         self._bot = None
         self._loop = None
         self._eventsub_ws = None
@@ -124,10 +192,10 @@ class BotRunner(QThread):
             return
         async def _send():
             try:
-                await self._bot._connection.send(f"PRIVMSG #{CHANNEL} :{text}")
+                await self._bot._connection.send(f"PRIVMSG #{self._channel} :{text}")
             except Exception:
                 pass
-            ch = self._bot.get_channel(CHANNEL) or next((c for c in self._bot.connected_channels if c is not None), None)
+            ch = self._bot.get_channel(self._channel) or next((c for c in self._bot.connected_channels if c is not None), None)
             if ch:
                 try:
                     await ch.send(text)
@@ -141,16 +209,43 @@ class BotRunner(QThread):
     def run(self):
         asyncio.run(self._run_bot_and_eventsub())
 
+    async def _get_token_user_login(self):
+        """Get the Twitch login of the account that owns the token (their channel)."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.twitch.tv/helix/users",
+                    headers=self._helix_headers(),
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    j = await r.json()
+                    users = j.get("data", [])
+                    if users:
+                        return (users[0].get("login") or "").strip().lower()
+        except Exception:
+            pass
+        return None
+
     async def _run_bot_and_eventsub(self):
         self._loop = asyncio.get_event_loop()
         if not self.access_token:
             self.error.emit("No access token in config.")
             return
+        if self._channel_override:
+            self._channel = self._channel_override
+        else:
+            token_login = await self._get_token_user_login()
+            if not token_login:
+                self.error.emit("Could not get channel from token. Set 'Channel to join' in Settings or check token.")
+                return
+            self._channel = token_login
+        self.channel_ready.emit(self._channel)
         try:
             self._bot = commands.Bot(
                 token=self.access_token,
                 prefix="!",
-                initial_channels=[CHANNEL],
+                initial_channels=[self._channel],
             )
             self._bot.runner = self
 
@@ -160,10 +255,10 @@ class BotRunner(QThread):
                 await self._bot._connection.wait_until_ready()
                 msg = "BabsBot here. I'll call out follows, raids, subs and redemptions."
                 try:
-                    await self._bot._connection.send(f"PRIVMSG #{CHANNEL} :{msg}")
+                    await self._bot._connection.send(f"PRIVMSG #{self._channel} :{msg}")
                 except Exception:
                     pass
-                ch = self._bot.get_channel(CHANNEL) or next((c for c in self._bot.connected_channels if c is not None), None)
+                ch = self._bot.get_channel(self._channel) or next((c for c in self._bot.connected_channels if c is not None), None)
                 if ch:
                     try:
                         await ch.send(msg)
@@ -229,7 +324,7 @@ class BotRunner(QThread):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    "https://api.twitch.tv/helix/users?login=" + CHANNEL,
+                    "https://api.twitch.tv/helix/users?login=" + self._channel,
                     headers=self._helix_headers(),
                 ) as r:
                     if r.status != 200:
@@ -310,7 +405,7 @@ class BotRunner(QThread):
         payload = ev.get("payload", {})
         sub_type = payload.get("subscription", {}).get("type")
         event = payload.get("event", {})
-        ch = self._bot.get_channel(CHANNEL)
+        ch = self._bot.get_channel(self._channel)
         if not ch:
             return
         user_name = (event.get("user_name") or event.get("from_broadcaster_user_name") or event.get("user_login") or "").strip()
@@ -338,22 +433,38 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("BabsBot Settings")
         self.setMinimumWidth(420)
+        self.setStyleSheet("""
+            QDialog { background: #1a1a1a; }
+            QLabel { color: #00ff00; }
+            QLineEdit { color: #00ff00; background: #2a2a2a; border: 1px solid rgba(0,255,0,0.4); }
+            QPushButton { color: #00ff00; background: rgba(0,255,0,0.12); border: 1px solid rgba(0,255,0,0.4); }
+            QPushButton:hover { background: rgba(0,255,0,0.22); }
+        """)
         layout = QVBoxLayout(self)
-        btn_tokens = QPushButton("Get Twitch Tokens")
-        btn_tokens.setMinimumHeight(44)
-        btn_tokens.clicked.connect(self._open_token_generator)
-        layout.addWidget(btn_tokens)
-        must_have_note = QLabel(
-            "Authorize as broadcaster (delboitv) or a mod. Paste the access token below. "
-            "Add Client ID (from dev.twitch.tv/console/apps) in optional fields—required for follow/sub/redemption."
+        easy_note = QLabel(
+            "Easiest: Add your Client ID below (click Show optional fields), then click \"Log in with Twitch\". "
+            "Your browser opens → click Authorize → token is filled for you. Then Save.\n"
+            "One-time: In dev.twitch.tv → your app → Redirect URIs, add: " + OAUTH_REDIRECT_URI
         )
-        must_have_note.setWordWrap(True)
-        must_have_note.setStyleSheet("color: #aaa; font-size: 11px;")
-        layout.addWidget(must_have_note)
+        easy_note.setWordWrap(True)
+        easy_note.setStyleSheet("color: #00ff00; font-size: 11px;")
+        layout.addWidget(easy_note)
+        who_posts = QLabel("The bot joins your channel and posts from the account you log in with. One account — no second \"bot\" account needed.")
+        who_posts.setWordWrap(True)
+        who_posts.setStyleSheet("color: #00ff00; font-size: 11px;")
+        layout.addWidget(who_posts)
+        layout.addWidget(QLabel("Channel to join (your stream — where the bot should post)"))
+        self.channel_edit = QLineEdit()
+        self.channel_edit.setPlaceholderText("e.g. delboitv — leave blank to use token account's channel")
+        layout.addWidget(self.channel_edit)
+        self.btn_login = QPushButton("Log in with Twitch")
+        self.btn_login.setMinimumHeight(44)
+        self.btn_login.clicked.connect(self._login_with_twitch)
+        layout.addWidget(self.btn_login)
+        layout.addWidget(QLabel("Access Token (filled by Log in above, or paste manually)"))
         self.access_edit = QLineEdit()
-        self.access_edit.setPlaceholderText("Access Token (oauth:...)")
+        self.access_edit.setPlaceholderText("oauth:...")
         self.access_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addWidget(QLabel("Access Token (oauth:...)"))
         layout.addWidget(self.access_edit)
         self.optional_container = QWidget()
         opt_layout = QVBoxLayout(self.optional_container)
@@ -372,7 +483,11 @@ class SettingsDialog(QDialog):
         self.show_optional_btn = QPushButton("Show optional fields (Refresh Token, Client ID)")
         self.show_optional_btn.clicked.connect(self._toggle_optional)
         layout.addWidget(self.show_optional_btn)
-        note = QLabel("Paste token and Client ID, then Save. Restart the app to connect.")
+        btn_manual = QPushButton("Or open token generator (manual copy‑paste)")
+        btn_manual.setMaximumWidth(280)
+        btn_manual.clicked.connect(self._open_token_generator)
+        layout.addWidget(btn_manual, alignment=Qt.AlignmentFlag.AlignCenter)
+        note = QLabel("After token is set, click Save. The bot will connect automatically.")
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -383,9 +498,15 @@ class SettingsDialog(QDialog):
         self.access_edit.setText(cfg.get("access_token", ""))
         self.refresh_edit.setText(cfg.get("refresh_token", ""))
         self.client_edit.setText(cfg.get("client_id", ""))
+        self.channel_edit.setText(cfg.get("channel", ""))
         has_optional = bool((cfg.get("refresh_token") or "").strip() or (cfg.get("client_id") or "").strip())
-        self.optional_container.setVisible(has_optional)
-        self._optional_visible = has_optional
+        no_token = not (cfg.get("access_token") or "").strip()
+        if no_token:
+            self.optional_container.setVisible(True)
+            self._optional_visible = True
+        else:
+            self.optional_container.setVisible(has_optional)
+            self._optional_visible = has_optional
         self.show_optional_btn.setText(self._optional_btn_text())
 
     def _optional_btn_text(self):
@@ -397,20 +518,64 @@ class SettingsDialog(QDialog):
         self.show_optional_btn.setText(self._optional_btn_text())
 
     def _open_token_generator(self):
-        from PyQt6.QtGui import QDesktopServices
-        from PyQt6.QtCore import QUrl
         QDesktopServices.openUrl(QUrl(TOKEN_GENERATOR_URL))
 
+    def _login_with_twitch(self):
+        client_id = self.client_edit.text().strip()
+        if not client_id:
+            QMessageBox.warning(
+                self,
+                "Client ID needed",
+                "Enter your Client ID first (click Show optional fields and paste it from dev.twitch.tv).\n\n"
+                "One-time: In your Twitch app settings, add this under Redirect URIs:\n" + OAUTH_REDIRECT_URI,
+            )
+            return
+        _oauth_token_queue.clear()
+        scope_param = urllib.parse.quote(OAUTH_SCOPES, safe="").replace("%20", "+")
+        state = secrets.token_urlsafe(16)
+        url = (
+            "https://id.twitch.tv/oauth2/authorize"
+            "?client_id=" + urllib.parse.quote(client_id, safe="")
+            + "&redirect_uri=" + urllib.parse.quote(OAUTH_REDIRECT_URI, safe="")
+            + "&response_type=token"
+            + "&scope=" + scope_param
+            + "&state=" + state
+            + "&force_verify=true"
+        )
+        thread = threading.Thread(target=_run_oauth_server, daemon=True)
+        thread.start()
+        QDesktopServices.openUrl(QUrl(url))
+        self.btn_login.setText("Waiting for you to click Authorize…")
+        self._oauth_check_timer = QTimer(self)
+        self._oauth_check_timer.timeout.connect(self._oauth_check_token)
+        self._oauth_check_timer.start(300)
+
+    def _oauth_check_token(self):
+        if _oauth_token_queue:
+            self._oauth_check_timer.stop()
+            token = _oauth_token_queue.pop(0)
+            if not token.startswith("oauth:"):
+                token = "oauth:" + token
+            self.access_edit.setText(token)
+            self.btn_login.setText("Log in with Twitch")
+            QMessageBox.information(self, "Token received", "Token is filled above. Click Save.")
+            return
+        if _oauth_server_ref[0] is None:
+            self._oauth_check_timer.stop()
+            self.btn_login.setText("Log in with Twitch")
+
     def _save(self):
+        ch = (self.channel_edit.text() or "").strip().lower().replace("#", "").strip() or None
         ok = save_config({
             "access_token": self.access_edit.text().strip(),
             "refresh_token": self.refresh_edit.text().strip(),
             "client_id": self.client_edit.text().strip(),
+            "channel": ch or "",
         })
         if not ok:
             QMessageBox.critical(self, "Error", "Could not save config. Check folder permissions.")
             return
-        QMessageBox.information(self, "Saved", "Config saved. Restart BabsBot to connect with the new token.")
+        QMessageBox.information(self, "Saved", "Saved. Connecting now…")
         self.accept()
 
 
@@ -425,20 +590,20 @@ class MainWindow(QMainWindow):
             QMainWindow { background: rgba(0,0,0,0.92); }
             QWidget#central {
                 background: rgba(20,20,20,0.9);
-                border: 1px solid rgba(255,255,255,0.12);
+                border: 1px solid rgba(0,255,0,0.3);
                 border-radius: 12px;
             }
-            QLabel { color: #fff; background: transparent; }
+            QLabel { color: #00ff00; background: transparent; }
             QPushButton {
-                background: rgba(255,255,255,0.08);
-                color: #fff;
-                border: 1px solid rgba(255,255,255,0.15);
+                background: rgba(0,255,0,0.12);
+                color: #00ff00;
+                border: 1px solid rgba(0,255,0,0.4);
                 border-radius: 4px;
                 padding: 4px;
             }
             QPushButton:hover {
-                background: rgba(255,255,255,0.18);
-                border-color: rgba(255,255,255,0.25);
+                background: rgba(0,255,0,0.22);
+                border-color: rgba(0,255,0,0.6);
             }
         """)
         central = QWidget()
@@ -467,7 +632,7 @@ class MainWindow(QMainWindow):
             logo_label.setPixmap(QPixmap(str(logo_path)).scaled(176, 176, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         else:
             logo_label.setText("(logo)")
-            logo_label.setStyleSheet("color: #666;")
+            logo_label.setStyleSheet("color: #00ff00;")
         logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo_label.setFixedSize(188, 188)
         layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -477,12 +642,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(test_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         credit = QLabel("Neuro + A.I. for DelboiTV")
         credit.setFont(QFont("Segoe UI", 7))
-        credit.setStyleSheet("color: #666; background: transparent;")
+        credit.setStyleSheet("color: #00ff00; background: transparent;")
         credit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(credit)
         layout.addStretch()
         self.bot_runner = None
         self._start_bot_from_config()
+        cfg = load_config()
+        if not (cfg.get("access_token") or "").strip():
+            QTimer.singleShot(100, self._open_settings)
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -509,23 +677,45 @@ class MainWindow(QMainWindow):
             cfg.get("access_token"),
             cfg.get("refresh_token"),
             cfg.get("client_id"),
+            cfg.get("channel"),
         )
         self.bot_runner.status.connect(self._on_bot_status)
         self.bot_runner.error.connect(self._on_bot_error)
         self.bot_runner.eventsub_warning.connect(self._on_eventsub_warning)
         self.bot_runner.eventsub_ready.connect(self._on_eventsub_ready)
+        self.bot_runner.channel_ready.connect(self._on_channel_ready)
         self.bot_runner.start()
         self.status_label.setText("Connecting…")
 
     def _on_bot_status(self, text):
         self.status_label.setText("Running")
 
+    def _on_channel_ready(self, channel):
+        self.status_label.setToolTip("Posting to #" + channel)
+
     def _on_bot_error(self, text):
         self.status_label.setText("Error")
         QMessageBox.warning(self, "BabsBot", f"Bot could not connect:\n\n{text}\n\nCheck your token in Settings (gear icon).")
 
     def _on_eventsub_warning(self, text):
-        QMessageBox.warning(self, "BabsBot EventSub", text)
+        is_scope = "scope" in text.lower() or "moderator:read:followers" in text
+        if is_scope:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("BabsBot EventSub")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText(
+                "Your token is missing a required permission.\n\n"
+                "Easiest: Open Settings (gear) and use \"Log in with Twitch\" — it gets a token with the right permissions. Then Save.\n\n"
+                "Or click \"Open token page\" to use the website and paste a token manually."
+            )
+            open_btn = msg.addButton("Open token page", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton(QMessageBox.StandardButton.Ok)
+            msg.exec()
+            if msg.clickedButton() == open_btn:
+                QDesktopServices.openUrl(QUrl(TOKEN_GENERATOR_URL))
+                QTimer.singleShot(500, self._open_settings)
+        else:
+            QMessageBox.warning(self, "BabsBot EventSub", text)
 
     def _on_eventsub_ready(self):
         self.status_label.setToolTip("EventSub: follow, raid, sub, redemption")

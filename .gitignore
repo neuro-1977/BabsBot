@@ -27,3 +27,6 @@ Thumbs.db
 # Optional assets (user-generated)
 icon.ico
 logo.png
+
+# Clean package for sending (exe + config copy)
+BabsBot_Package/
